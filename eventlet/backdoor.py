@@ -6,6 +6,7 @@ import socket
 import sys
 import errno
 import traceback
+import re
 
 import eventlet
 from eventlet import hubs
@@ -49,32 +50,25 @@ class FileProxy(object):
 # @@tavis: the `locals` args below mask the built-in function.  Should
 # be renamed.
 class SocketConsole(greenlets.greenlet):
-    def __init__(self, desc, hostport, locals):
+    def __init__(self, conn, hostport, locals):
+        self.conn = conn
         self.hostport = hostport
         self.locals = locals
-        # mangle the socket
-        self.desc = FileProxy(desc)
         greenlets.greenlet.__init__(self)
 
     def run(self):
         try:
-            console = InteractiveConsole(self.locals)
+            console = InteractiveSocketConsole(self.conn, self.locals)
             console.interact()
         finally:
-            self.switch_out()
             self.finalize()
 
     def switch(self, *args, **kw):
-        self.saved = sys.stdin, sys.stderr, sys.stdout
-        sys.stdin = sys.stdout = sys.stderr = self.desc
         greenlets.greenlet.switch(self, *args, **kw)
-
-    def switch_out(self):
-        sys.stdin, sys.stderr, sys.stdout = self.saved
 
     def finalize(self):
         # restore the state of the socket
-        self.desc = None
+        self.conn.close()
         if len(self.hostport) >= 2:
             host = self.hostport[0]
             port = self.hostport[1]
@@ -112,9 +106,6 @@ def backdoor_server(sock, locals=None):
                 # Broken pipe means it was shutdown
                 if get_errno(e) != errno.EPIPE:
                     raise
-            finally:
-                if socketpair:
-                    socketpair[0].close()
     finally:
         sock.close()
 
@@ -134,11 +125,60 @@ def backdoor(conn_info, locals=None):
         print("backdoor to %s:%s" % (host, port))
     else:
         print('backdoor opened')
-    fl = conn.makefile("rw")
-    console = SocketConsole(fl, addr, locals)
+    console = SocketConsole(conn, addr, locals)
     hub = hubs.get_hub()
     hub.schedule_call_global(0, console.switch)
 
+class SocketStdout(object):
+    """minimal file-like object to accept print calls etc"""
+    def __init__(self, isc):
+        super(SocketStdout, self).__init__()
+        self.isc = isc
+    
+    def write(self, msg): self.isc.write(msg)
+
+class InteractiveSocketConsole(InteractiveConsole):
+    """Eventlet's variant of InteractiveConsole from the stdlib's code
+    module with the stdin/out bits swapped out for socket equivalents.
+
+    Concerns: Non-US locales, non-socket backdoors"""
+    def __init__(self, conn, locals=None):
+        super(InteractiveSocketConsole, self).__init__(locals)
+        self.conn = conn
+        self.sockBuffer = b'' #using a bytes will result in some GC churn. Look for a better byte buffer
+        self.socketStdout = SocketStdout(self)
+        
+    def write(self, data):
+        if isinstance(data, str):
+            data = data.encode()
+        #              V replace newlines without carriage returns, I think
+        self.conn.send(re.sub(rb"(?<!\r)\n", b"\r\n", data))
+
+
+    def raw_input(self, prompt=b""):
+        """Write a prompt and read a line.
+
+        The returned line does not include the trailing newline.
+        When the user enters the EOF key sequence, EOFError is raised.
+
+        """
+        self.write(prompt)
+
+        while b"\n" not in self.sockBuffer:
+            self.sockBuffer += self.conn.recv(1024)
+
+        eol = self.sockBuffer.index(b"\n")
+        line = self.sockBuffer[:eol]
+        self.sockBuffer = self.sockBuffer[eol+1:]
+
+        return line.decode()
+
+    def push(self, line):
+        realStdout = sys.stdout
+        sys.stdout = self.socketStdout
+
+        super(InteractiveSocketConsole, self).push(line)
+        sys.stdout = realStdout
 
 if __name__ == '__main__':
     backdoor_server(eventlet.listen(('127.0.0.1', 9000)), {})
